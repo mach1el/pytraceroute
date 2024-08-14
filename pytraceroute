@@ -1,0 +1,300 @@
+#!/usr/bin/env python
+
+import os
+import sys
+import time
+import json
+import getopt
+import select
+import requests
+from random import randrange
+from struct import pack, unpack
+from socket import (
+  SOL_IP,
+  IP_TTL,
+  AF_INET,
+  SOCK_RAW,
+  SOCK_DGRAM,
+  IPPROTO_ICMP,
+  IPPROTO_UDP,
+  socket,
+  timeout,
+  gethostbyaddr,
+  gethostbyname,
+  htons,
+  inet_aton,
+)
+
+def msg(msg, color="red"):
+  if color == "white":
+    return "\x1b[0m" + str(msg)
+  else:
+    return "\033[1;91m" + str(msg) + "\x1b[0m"
+
+def checksum(header):
+  if len(header) % 2 == 1:
+    header += b'\0'
+  checksum = sum(unpack("!%dH" % (len(header) // 2), header))
+  while checksum >> 16:
+    checksum = (checksum & 0xFFFF) + (checksum >> 16)
+  return ~checksum & 0xFFFF
+
+def resolve_host(dst):
+  try:
+    pri_hostname, alias, ip_addr = gethostbyaddr(dst)
+    result = f"{dst} :: {pri_hostname}"
+  except:
+    result = f"{dst}"
+  return result
+
+def geoip(dst):
+  try:
+    response = requests.get(f"http://ip-api.com/json/{dst}")
+    raw_response = response.content
+    json_response = json.loads(raw_response)
+    try:
+      items = [json_response[item] for item in (["country", "regionName", "city"])]
+    except:
+      result = ""
+    else:
+      result = ', '.join([item for item in items if item])
+  except Exception as e:
+    print(msg(e))
+  except KeyboardInterrupt:
+    sys.exit(msg('[-] Canceled by user'))
+
+  return result
+
+class IPHeader:
+  def __init__(self, proto=IPPROTO_ICMP, id=None, src="0.0.0.0", dst=None):
+    self.version = 4
+    self.ihl = 5 
+    self.version_ihl = (self.version << 4) + self.ihl
+    self.type_of_service = 0
+    self.total_length = 60
+    self.ip_header_id = id or (os.getpid() & 0xFFFF)
+    self.flags = 0
+    self.fragment_offset = 0
+    self.flags_fragment_offset = (self.flags << 13) + self.fragment_offset
+    self._time_to_live = 1
+    self.protocol = proto
+    self.header_checksum = 0
+    self.source_ip = inet_aton(src)
+    self.destination_ip = inet_aton(dst)
+    self._ip_header_data = b""
+
+  @property
+  def time_to_live(self):
+    return self._time_to_live
+  
+  @time_to_live.setter
+  def time_to_live(self, value):
+    self._time_to_live = value
+
+  @property
+  def ip_header_data(self):
+    return self._ip_header_data
+  
+  @ip_header_data.setter
+  def ip_header_data(self, value):
+    self._ip_header_data = value
+
+  def ip_header_assemble(self):
+    ip_header = pack(
+      "!BBHHHBBH4s4s",
+      self.version_ihl,
+      self.type_of_service,
+      self.total_length,
+      self.ip_header_id,
+      self.flags_fragment_offset,
+      self._time_to_live,
+      self.protocol,
+      self.header_checksum,
+      self.source_ip,
+      self.destination_ip
+    )
+
+    header_checksum = checksum(ip_header)
+    
+    ip_header = pack(
+      "!BBHHHBBH4s4s",
+      self.version_ihl,
+      self.type_of_service,
+      self.total_length,
+      self.ip_header_id,
+      self.flags_fragment_offset,
+      self._time_to_live,
+      self.protocol,
+      htons(header_checksum),
+      self.source_ip,
+      self.destination_ip
+    )
+
+    return ip_header + self._ip_header_data
+
+class ICMPHeader:
+  def __init__(self, id=None, sequence=1, icmp_data=b""):
+    self.icmp_type = 8
+    self.icmp_code = 0
+    self.checksum_field = 0
+    self._icmp_id = id or (os.getpid() & 0xFFFF)
+    self.sequence = sequence
+    self._icmp_data = icmp_data
+
+  @property
+  def icmp_id(self):
+    return self._icmp_id
+  
+  @icmp_id.setter
+  def icmp_id(self, value):
+    self._icmp_id = value
+
+  @property
+  def icmp_data(self):
+    return self._icmp_data
+  
+  @icmp_data.setter
+  def icmp_data(self, value):
+    self._icmp_data = value
+
+  def icmp_header_assemble(self):
+    header = pack(
+      '!BBHHH',
+      self.icmp_type,
+      self.icmp_code,
+      self.checksum_field,
+      self._icmp_id,
+      self.sequence
+    )
+      
+    header_checksum = checksum(header + self._icmp_data)
+
+    header = pack(
+      '!BBHHH',
+      self.icmp_type,
+      self.icmp_code,
+      htons(header_checksum),
+      self._icmp_id,
+      self.sequence
+    )
+    
+    return header + self._icmp_data
+
+class PacketBuilder(IPHeader, ICMPHeader):
+  def __init__(self, ttl=1, id=None, src="0.0.0.0", dst=None, data=b""):
+    IPHeader.__init__(self, id=id, src=src, dst=dst)
+    ICMPHeader.__init__(self, id=id, icmp_data=data)
+    self.time_to_live = ttl
+    self.ip_header_id += self.time_to_live 
+    if not data:
+      self.icmp_data = b"\x00" * 20
+    self.ip_header_data = self.icmp_header_assemble()
+
+  @property
+  def pkt(self):
+    return self.ip_header_assemble()
+
+class Traceroute:
+  def __init__(self, dst, hops=30):
+    self.dst = gethostbyname(dst)
+    self.hops = hops
+    self.recvto = pack('ll', 2, 0)
+    self.repeat_threshold = 3
+  
+  def _start_icmp(self):
+    previous_result = None
+    repeat_count = 0
+    
+    for ttl in range(1, (self.hops + 1)):
+      recver = None
+      sender = None
+      try:
+        recver = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)
+        sender = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        sender.setsockopt(SOL_IP, IP_TTL, ttl)
+        recver.bind(("", 0))
+
+        build_packet = PacketBuilder(ttl=ttl, dst=self.dst)
+        pkt = build_packet.pkt
+
+        port = randrange(33434, 33460)
+        sender.sendto(pkt, (self.dst, port))
+
+        started = time.time()
+        ready = select.select([recver], [], [], 2.0)
+
+        if ready[0] == []:
+          print(f"{ttl} *")
+          previous_result = None
+          repeat_count = 0
+          continue
+
+        recvPkt, addrs = recver.recvfrom(65565)
+        timerecv = time.time()
+      except timeout:
+        print(f"{ttl} * Request timed out.")
+        previous_result = None
+        repeat_count = 0
+        continue
+      except KeyboardInterrupt:
+        sys.exit(msg("[-] Canceled by user"))
+      except Exception as e:
+        print(msg(f"Error: {e}"))
+        continue
+      else:
+        timing = (timerecv - started) * 1000
+        location = geoip(addrs[0])
+        resolved_host = resolve_host(addrs[0])
+        result = f"{resolved_host} :: {location}"
+
+        print(f"{ttl} {timing:.2f}ms {result}")
+        
+        if result == previous_result:
+          repeat_count += 1
+        else:
+          repeat_count = 1
+
+        previous_result = result
+
+        if repeat_count >= self.repeat_threshold:
+          break
+
+      finally:
+        sys.stdout.flush()
+        if recver is not None:
+          recver.close()
+        if sender is not None:
+          sender.close()
+
+def main():
+  try:
+    opts, args = getopt.getopt(sys.argv[1:], "hm:", ["help", "hops="])
+  except getopt.GetoptError as err:
+    print(str(err))
+    sys.exit(2)
+  
+  hops = 30
+  
+  for opt, arg in opts:
+    if opt in ("-h", "--help"):
+      print(f"Usage: {sys.argv[0]} [options] [host]")
+      print("Options:")
+      print("  -h, --help       Show this help message and exit")
+      print("  -m, --hops       Set the maximum number of hops (default is 30)")
+      sys.exit()
+    elif opt in ("-m", "--hops"):
+      try:
+        hops = int(arg)
+      except ValueError:
+        print("Error: Hops must be an integer.")
+        sys.exit(2)
+
+  if len(args) < 1:
+    print(f"Usage: {sys.argv[0]} [options] [host]")
+    sys.exit(2)
+
+  destination = args[0]
+  
+  Traceroute(destination, hops=hops)._start_icmp()
+
+if __name__ == "__main__": main()
