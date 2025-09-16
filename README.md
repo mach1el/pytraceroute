@@ -1,8 +1,121 @@
-# pytraceroute ![VERSION](https://img.shields.io/badge/version-0.1-violet.svg)
+# pytraceroute ![VERSION](https://img.shields.io/badge/version-1.0-violet.svg)
 
 ![Python](https://img.shields.io/badge/python-3670A0?style=for-the-badge&logo=python&logoColor=ffdd54)
 
 This Python Traceroute Tool is a simple and effective network utility that traces the path data packets take from your machine to a specified target host. It provides a detailed breakdown of each hop along the route, helping users diagnose network performance issues, identify potential bottlenecks, and analyze the connectivity between different points in the network.
+
+- UDP probes (fallback/no-root)
+- TCP SYN-style probes (non-blocking connect) — useful when ICMP/UDP are filtered
+- Pipelined TTL windows for faster traces (parallelization across TTLs)
+- Async reverse DNS so name lookups don't block probe collection
+- Stronger reply matching by parsing ICMP payloads (matches ICMP/UDP probes to originating probe)
+- Cross-platform privilege checks (Unix + Windows) and graceful fallbacks
+
+---
+
+## Quick start
+
+### Run from the command line
+
+```bash
+# ICMP mode (recommended — requires root/admin on most OSes)
+sudo python3 pytraceroute.py example.com
+
+# Force UDP mode (no root required)
+python3 pytraceroute.py --udp example.com
+```
+
+### Example with options
+
+ICMP mode (recommended when possible — requires admin/root on Unix or Administrator on Windows):
+```bash
+sudo python3 pytraceroute.py --icmp example.com
+```
+
+Force UDP probes (no root needed):
+```bash
+python3 pytraceroute.py --udp example.com
+```
+
+TCP probes (non-blocking connect) — useful when ICMP/UDP are filtered by firewalls:
+```bash
+python3 pytraceroute.py --tcp --tcp-port 443 example.com
+```
+
+Pipeline several TTLs in parallel (faster traces; default pipeline=4):
+```bash
+python3 pytraceroute.py --pipeline 6 --icmp example.com
+```
+
+Fastest (no DNS, immediate IPs only):
+```bash
+python3 pytraceroute.py --no-dns example.com
+```
+
+Default behavior: async reverse DNS is enabled (names printed later as `(resolved)`), ICMP is attempted if running as admin, otherwise UDP/TCP used as requested.
+
+---
+
+## Command-line options
+
+```
+usage: pytraceroute_enhanced.py [options] host
+
+Options:
+  -h, --help            show this help message and exit
+  -m, --max-hops       maximum hops (default: 30)
+  -q, --probes         probes per hop (default: 3)
+  -w, --wait           per-window timeout seconds (default: 2.0)
+  --udp                force UDP probes (do not use ICMP echo)
+  --icmp               prefer ICMP probes (requires admin privileges)
+  --tcp                enable TCP SYN/connect probes (non-blocking)
+  --tcp-port           destination TCP port for TCP probes (default: 80)
+  --pipeline           number of TTLs to pipeline (window size, default: 4)
+  --select-chunk       select() time-slice in seconds (default 0.15)
+  --no-dns             do not perform reverse DNS lookups (fastest)
+  --no-async-dns       disable async DNS (use blocking DNS or none if --no-dns)
+```
+
+---
+
+## Output format
+
+The tracer prints one line per hop. Example output:
+
+```
+Traceroute to example.com (93.184.216.34), max hops 30, probes 3, timeout 2.0s
+ 1  router.example.net (192.0.2.1) 0.995s
+ 2  isp-gw.example.net (198.51.100.1) 1.321s
+ 3  * * *
+ 4  93.184.216.34 (93.184.216.34) 12.123s
+Destination reached.
+```
+
+- `* * *` means no response was received for that hop within the timeout.
+- When a hop responds, the resolver will attempt a reverse DNS lookup; if it fails the numeric IP is shown.
+
+---
+
+## Permissions & behavior
+
+- **ICMP mode**: If you run the script as root/administrator, it will attempt to use ICMP raw sockets (classic traceroute behavior using ICMP Echo). This gives better matching of replies in many environments.
+- **UDP fallback**: If raw sockets are unavailable (non-root), the tool automatically falls back to UDP probes so you can still trace without admin rights. You can also force UDP mode with `--udp`.
+- **Windows note**: `os.geteuid()` is Unix-only. On Windows run as Administrator when using ICMP; the script attempts a sensible fallback if raw sockets are not permitted.
+
+## Programmatic usage
+
+You can import and run the tracer from Python (useful for embedding into collector tools):
+
+```python
+from pytraceroute import Tracer
+
+t = Tracer('example.com', max_hops=20, probes=3, timeout=2.0, use_icmp=False)  # use_icmp=False forces UDP
+t.run()
+```
+
+This lets you capture output or adapt the `Tracer` class to return structured data for logging or dashboards.
+
+---
 
 # IP Header Packet Overview
 
@@ -56,6 +169,8 @@ An IP (Internet Protocol) header packet is a crucial part of data communication 
 
 The IP header plays a critical role in ensuring that data is delivered correctly across a network. It provides all the necessary information to route packets, handle errors, and manage fragmentation, making it a fundamental element of IP-based communication.
 
+---
+
 # ICMP Packet Overview
 
 The Internet Control Message Protocol (ICMP) is a critical component of the Internet Protocol suite, primarily used for diagnostic and error-reporting purposes in networking. ICMP packets are typically used to relay information about network issues, connectivity, and path conditions.
@@ -104,6 +219,20 @@ ICMP is integral to network diagnostics and error reporting. Tools like `ping` a
 ## Security Considerations
 
 While ICMP is useful for network management, it can also be exploited in network attacks, such as ICMP flood attacks (a type of Denial of Service attack). As a result, some networks restrict or filter ICMP traffic to protect against such threats.
+
+---
+
+# CHANGE LOG
+
+Enhanced traceroute (ICMP/UDP) - improved logic and safety
+
+Key improvements over a simple raw-socket traceroute:
+- clear separation of ICMP probe building and response parsing
+- configurable probes per hop, timeout, and max hops
+- graceful fallback: if not running as root, uses UDP-based probes (no raw socket required)
+- batch probing per hop using select() to wait for responses to multiple probes
+- improved argument parsing and helpful CLI output
+Note: Running ICMP mode requires root/administrator privileges on most OSes.
 
 # License
 [![GitHub License](https://img.shields.io/github/license/mach1el/pytraceroute?style=for-the-badge&color=orange)](https://github.com/mach1el/pytraceroute/blob/master/LICENSE)

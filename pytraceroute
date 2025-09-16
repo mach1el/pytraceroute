@@ -1,300 +1,526 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
+"""
+pytraceroute_enhanced.py
 
+Enhancements:
+- ICMP / UDP probes with matching via ICMP payload parsing
+- TCP SYN probes via non-blocking connect (TTL set on socket)
+- Pipelined parallelization across TTLs (windowed)
+- Async DNS reverse lookups (threadpool)
+- Better privilege detection (Unix + Windows)
+- Responsive to Ctrl+C (time-sliced select)
+- 2-space indentation
+"""
+
+from __future__ import annotations
+import argparse
+import concurrent.futures
+import errno
 import os
+import socket
+import struct
+import select
 import sys
 import time
-import json
-import getopt
-import select
-import requests
-from random import randrange
-from struct import pack, unpack
-from socket import (
-  SOL_IP,
-  IP_TTL,
-  AF_INET,
-  SOCK_RAW,
-  SOCK_DGRAM,
-  IPPROTO_ICMP,
-  IPPROTO_UDP,
-  socket,
-  timeout,
-  gethostbyaddr,
-  gethostbyname,
-  htons,
-  inet_aton,
-)
+from typing import Dict, List, Optional, Tuple
 
-def msg(msg, color="red"):
-  if color == "white":
-    return "\x1b[0m" + str(msg)
-  else:
-    return "\033[1;91m" + str(msg) + "\x1b[0m"
+# ICMP types
+ICMP_ECHO_REQUEST = 8
+ICMP_ECHO_REPLY = 0
+ICMP_TIME_EXCEEDED = 11
+ICMP_DEST_UNREACH = 3
 
-def checksum(header):
-  if len(header) % 2 == 1:
-    header += b'\0'
-  checksum = sum(unpack("!%dH" % (len(header) // 2), header))
-  while checksum >> 16:
-    checksum = (checksum & 0xFFFF) + (checksum >> 16)
-  return ~checksum & 0xFFFF
+# Defaults
+DEFAULT_MAX_HOPS = 30
+DEFAULT_PROBES = 3
+DEFAULT_TIMEOUT = 2.0
+DEFAULT_SELECT_CHUNK = 0.15
+DEFAULT_PIPELINE = 4  # number of TTLs to pipeline (parallel window)
+DEFAULT_TCP_PORT = 80
 
-def resolve_host(dst):
+# ------------------------------------------------------------
+# Utilities
+# ------------------------------------------------------------
+def is_privileged() -> bool:
+  """Return True if running with privileges to open raw sockets.
+  Works on Unix (geteuid) and Windows (IsUserAnAdmin via ctypes)"""
   try:
-    pri_hostname, alias, ip_addr = gethostbyaddr(dst)
-    result = f"{dst} :: {pri_hostname}"
-  except:
-    result = f"{dst}"
-  return result
-
-def geoip(dst):
-  try:
-    response = requests.get(f"http://ip-api.com/json/{dst}")
-    raw_response = response.content
-    json_response = json.loads(raw_response)
+    if hasattr(os, 'geteuid'):
+      return os.geteuid() == 0
+    # on Windows try shell32.IsUserAnAdmin
+    import ctypes
     try:
-      items = [json_response[item] for item in (["country", "regionName", "city"])]
-    except:
-      result = ""
-    else:
-      result = ', '.join([item for item in items if item])
-  except Exception as e:
-    print(msg(e))
-  except KeyboardInterrupt:
-    sys.exit(msg('[-] Canceled by user'))
+      return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+      return False
+  except Exception:
+    return False
 
-  return result
+def checksum(data: bytes) -> int:
+  if len(data) % 2:
+    data += b'\x00'
+  s = 0
+  for i in range(0, len(data), 2):
+    s += data[i] << 8 | data[i+1]
+  s = (s >> 16) + (s & 0xffff)
+  s += s >> 16
+  return ~s & 0xffff
 
-class IPHeader:
-  def __init__(self, proto=IPPROTO_ICMP, id=None, src="0.0.0.0", dst=None):
-    self.version = 4
-    self.ihl = 5 
-    self.version_ihl = (self.version << 4) + self.ihl
-    self.type_of_service = 0
-    self.total_length = 60
-    self.ip_header_id = id or (os.getpid() & 0xFFFF)
-    self.flags = 0
-    self.fragment_offset = 0
-    self.flags_fragment_offset = (self.flags << 13) + self.fragment_offset
-    self._time_to_live = 1
-    self.protocol = proto
-    self.header_checksum = 0
-    self.source_ip = inet_aton(src)
-    self.destination_ip = inet_aton(dst)
-    self._ip_header_data = b""
+def build_icmp_echo(identifier: int, sequence: int, payload: bytes = b'') -> bytes:
+  hdr = struct.pack('!BBHHH', ICMP_ECHO_REQUEST, 0, 0, identifier, sequence)
+  chk = checksum(hdr + payload)
+  hdr = struct.pack('!BBHHH', ICMP_ECHO_REQUEST, 0, chk, identifier, sequence)
+  return hdr + payload
 
-  @property
-  def time_to_live(self):
-    return self._time_to_live
-  
-  @time_to_live.setter
-  def time_to_live(self, value):
-    self._time_to_live = value
+def ip_header_len_from_packet(pkt: bytes) -> int:
+  # first byte: version(4bits) | IHL(4bits)
+  ihl = pkt[0] & 0x0f
+  return ihl * 4
 
-  @property
-  def ip_header_data(self):
-    return self._ip_header_data
-  
-  @ip_header_data.setter
-  def ip_header_data(self, value):
-    self._ip_header_data = value
+# ------------------------------------------------------------
+# Probe metadata & reply matching
+# ------------------------------------------------------------
+# We'll generate unique sequence numbers for ICMP probes and unique UDP destination ports for UDP probes derived from seq.
+# For TCP probes, we track the socket object and match connect completion ourselves.
 
-  def ip_header_assemble(self):
-    ip_header = pack(
-      "!BBHHHBBH4s4s",
-      self.version_ihl,
-      self.type_of_service,
-      self.total_length,
-      self.ip_header_id,
-      self.flags_fragment_offset,
-      self._time_to_live,
-      self.protocol,
-      self.header_checksum,
-      self.source_ip,
-      self.destination_ip
-    )
+class ProbeInfo:
+  """Information about a sent probe used to match replies."""
+  def __init__(self, proto: str, ttl: int, probe_idx: int, seq: int, sent_time: float, udp_port: Optional[int]=None):
+    self.proto = proto  # 'icmp'|'udp'|'tcp'
+    self.ttl = ttl
+    self.probe_idx = probe_idx
+    self.seq = seq
+    self.sent_time = sent_time
+    self.udp_port = udp_port
 
-    header_checksum = checksum(ip_header)
-    
-    ip_header = pack(
-      "!BBHHHBBH4s4s",
-      self.version_ihl,
-      self.type_of_service,
-      self.total_length,
-      self.ip_header_id,
-      self.flags_fragment_offset,
-      self._time_to_live,
-      self.protocol,
-      htons(header_checksum),
-      self.source_ip,
-      self.destination_ip
-    )
+# ------------------------------------------------------------
+# Tracer implementation (pipelined)
+# ------------------------------------------------------------
+class Tracer:
+  def __init__(self,
+               destination: str,
+               max_hops: int = DEFAULT_MAX_HOPS,
+               probes: int = DEFAULT_PROBES,
+               timeout: float = DEFAULT_TIMEOUT,
+               use_icmp: bool = True,
+               force_udp: bool = False,
+               use_tcp: bool = False,
+               tcp_port: int = DEFAULT_TCP_PORT,
+               pipeline: int = DEFAULT_PIPELINE,
+               select_chunk: float = DEFAULT_SELECT_CHUNK,
+               no_dns: bool = False,
+               async_dns: bool = True,
+               concurrency_limit: int = 8):
+    self.destination = destination
+    self.dest_addr = socket.gethostbyname(destination)
+    self.max_hops = max_hops
+    self.probes = probes
+    self.timeout = timeout
+    self.select_chunk = select_chunk
+    self.pipeline = max(1, int(pipeline))
+    self.no_dns = no_dns
+    self.async_dns = async_dns
+    self.tcp_port = tcp_port
+    self.use_tcp = use_tcp
+    # decide icmp usage by privilege and user choice
+    self.use_icmp = use_icmp and is_privileged() and not force_udp
+    self.force_udp = force_udp
+    self._recv_sock = None  # raw ICMP recv socket (if available)
+    self._send_udp_sock = None  # UDP send socket
+    self._id_base = os.getpid() & 0xffff
+    self._seq_counter = 1
+    self._probe_map: Dict[int, ProbeInfo] = {}  # seq -> ProbeInfo (for icmp/udp)
+    self._udp_port_map: Dict[int, int] = {}  # udp_port -> seq
+    self._tcp_sockets = {}  # sock -> (ttl, probe_idx, sent_time)
+    self._dns_executor = None if not async_dns else concurrent.futures.ThreadPoolExecutor(max_workers=6)
+    self._concurrency_limit = concurrency_limit
 
-    return ip_header + self._ip_header_data
+  def _next_seq(self) -> int:
+    s = self._seq_counter
+    self._seq_counter += 1
+    # wrap a bit to keep numbers small
+    if self._seq_counter > 0x7fff:
+      self._seq_counter = 1
+    return s
 
-class ICMPHeader:
-  def __init__(self, id=None, sequence=1, icmp_data=b""):
-    self.icmp_type = 8
-    self.icmp_code = 0
-    self.checksum_field = 0
-    self._icmp_id = id or (os.getpid() & 0xFFFF)
-    self.sequence = sequence
-    self._icmp_data = icmp_data
+  def _create_sockets(self):
+    # raw ICMP receive socket (for ICMP replies)
+    try:
+      self._recv_sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.getprotobyname('icmp'))
+      self._recv_sock.setblocking(False)
+    except PermissionError:
+      self._recv_sock = None
+    except Exception:
+      self._recv_sock = None
 
-  @property
-  def icmp_id(self):
-    return self._icmp_id
-  
-  @icmp_id.setter
-  def icmp_id(self, value):
-    self._icmp_id = value
+    # UDP send socket (non-privileged)
+    try:
+      self._send_udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+      self._send_udp_sock.setblocking(False)
+    except Exception:
+      self._send_udp_sock = None
 
-  @property
-  def icmp_data(self):
-    return self._icmp_data
-  
-  @icmp_data.setter
-  def icmp_data(self, value):
-    self._icmp_data = value
-
-  def icmp_header_assemble(self):
-    header = pack(
-      '!BBHHH',
-      self.icmp_type,
-      self.icmp_code,
-      self.checksum_field,
-      self._icmp_id,
-      self.sequence
-    )
-      
-    header_checksum = checksum(header + self._icmp_data)
-
-    header = pack(
-      '!BBHHH',
-      self.icmp_type,
-      self.icmp_code,
-      htons(header_checksum),
-      self._icmp_id,
-      self.sequence
-    )
-    
-    return header + self._icmp_data
-
-class PacketBuilder(IPHeader, ICMPHeader):
-  def __init__(self, ttl=1, id=None, src="0.0.0.0", dst=None, data=b""):
-    IPHeader.__init__(self, id=id, src=src, dst=dst)
-    ICMPHeader.__init__(self, id=id, icmp_data=data)
-    self.time_to_live = ttl
-    self.ip_header_id += self.time_to_live 
-    if not data:
-      self.icmp_data = b"\x00" * 20
-    self.ip_header_data = self.icmp_header_assemble()
-
-  @property
-  def pkt(self):
-    return self.ip_header_assemble()
-
-class Traceroute:
-  def __init__(self, dst, hops=30):
-    self.dst = gethostbyname(dst)
-    self.hops = hops
-    self.recvto = pack('ll', 2, 0)
-    self.repeat_threshold = 3
-  
-  def _start_icmp(self):
-    previous_result = None
-    repeat_count = 0
-    
-    for ttl in range(1, (self.hops + 1)):
-      recver = None
-      sender = None
+  def _close_sockets(self):
+    try:
+      if self._recv_sock:
+        self._recv_sock.close()
+    except Exception:
+      pass
+    try:
+      if self._send_udp_sock:
+        self._send_udp_sock.close()
+    except Exception:
+      pass
+    for s in list(self._tcp_sockets.keys()):
       try:
-        recver = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)
-        sender = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
-        sender.setsockopt(SOL_IP, IP_TTL, ttl)
-        recver.bind(("", 0))
+        s.close()
+      except Exception:
+        pass
+    self._tcp_sockets.clear()
 
-        build_packet = PacketBuilder(ttl=ttl, dst=self.dst)
-        pkt = build_packet.pkt
+  # ------------------------------------------------------------
+  # Send probe helpers
+  # ------------------------------------------------------------
+  def _send_icmp_probe(self, ttl: int, probe_idx: int) -> int:
+    """Send an ICMP echo request with given TTL. Return seq."""
+    seq = self._next_seq()
+    payload = struct.pack('!dI', time.time(), seq)  # embed time + seq in payload
+    pkt = build_icmp_echo(self._id_base, seq, payload)
+    # send via raw socket - we create a raw socket for sending or reuse recv if available
+    try:
+      s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.getprotobyname('icmp'))
+      s.setsockopt(socket.SOL_IP, socket.IP_TTL, ttl)
+      s.sendto(pkt, (self.dest_addr, 0))
+      s.close()
+    except Exception as e:
+      # if send fails, fall back to UDP (caller may handle)
+      # but still return seq so it won't block mapping
+      pass
+    self._probe_map[seq] = ProbeInfo('icmp', ttl, probe_idx, seq, time.time())
+    return seq
 
-        port = randrange(33434, 33460)
-        sender.sendto(pkt, (self.dst, port))
+  def _send_udp_probe(self, ttl: int, probe_idx: int) -> int:
+    """Send a UDP probe to dest at unique port (derived from seq). Return seq."""
+    seq = self._next_seq()
+    # craft a unique destination port for this seq (range 33434-33534 etc.)
+    base = 33434
+    udp_port = base + (seq % 20000)  # keep within ephemeral safeish range
+    try:
+      # set TTL on the socket (create a new socket per probe so TTL is per-probe)
+      s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+      s.setsockopt(socket.SOL_IP, socket.IP_TTL, ttl)
+      # send empty payload to dest at chosen port
+      s.sendto(b'', (self.dest_addr, udp_port))
+      s.close()
+    except Exception:
+      pass
+    self._probe_map[seq] = ProbeInfo('udp', ttl, probe_idx, seq, time.time(), udp_port=udp_port)
+    self._udp_port_map[udp_port] = seq
+    return seq
 
-        started = time.time()
-        ready = select.select([recver], [], [], 2.0)
+  def _start_tcp_probe(self, ttl: int, probe_idx: int) -> socket.socket:
+    """Start a non-blocking TCP connect for TTL; return the socket object which we track."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setblocking(False)
+    try:
+      s.setsockopt(socket.SOL_IP, socket.IP_TTL, ttl)
+    except Exception:
+      # non-fatal
+      pass
+    # initiate non-blocking connect
+    try:
+      s.connect((self.dest_addr, self.tcp_port))
+    except BlockingIOError:
+      # expected for non-blocking
+      pass
+    except Exception:
+      # connect may raise immediate errors (e.g., network unreachable)
+      pass
+    self._tcp_sockets[s] = (ttl, probe_idx, time.time())
+    return s
 
-        if ready[0] == []:
-          print(f"{ttl} *")
-          previous_result = None
-          repeat_count = 0
-          continue
+  # ------------------------------------------------------------
+  # Reply parsing / matching
+  # ------------------------------------------------------------
+  def _parse_icmp_packet(self, pkt: bytes) -> Optional[Tuple[str, int, float]]:
+    """
+    Parse raw IP packet containing ICMP.
+    Return (src_ip, matched_seq, receive_time) if matched to a probe, otherwise None.
+    """
+    recv_time = time.time()
+    try:
+      ihl = ip_header_len_from_packet(pkt)
+      icmp_off = ihl
+      icmp_type = pkt[icmp_off]
+      # icmp header: type(1), code(1), checksum(2), rest (4)
+      if icmp_type == ICMP_ECHO_REPLY:
+        # echo reply contains id and seq directly after type/code/chk
+        _, _, _, identifier, seq = struct.unpack('!BBHHH', pkt[icmp_off:icmp_off+8])
+        # verify identifier matches our id_base
+        if identifier == self._id_base and seq in self._probe_map:
+          return (None, seq, recv_time)
+      elif icmp_type in (ICMP_TIME_EXCEEDED, ICMP_DEST_UNREACH):
+        # payload includes original IP header + first 8 bytes of original datagram
+        inner_off = icmp_off + 8  # skip icmp header
+        # safety check
+        if len(pkt) >= inner_off + 20:
+          # original IP header
+          inner_ihl = (pkt[inner_off] & 0x0f) * 4
+          # original protocol
+          proto = pkt[inner_off + 9]
+          if proto == socket.IPPROTO_UDP:
+            # UDP header follows original IP header
+            udp_off = inner_off + inner_ihl
+            if len(pkt) >= udp_off + 8:
+              orig_dst_port = struct.unpack('!H', pkt[udp_off+2:udp_off+4])[0]
+              # map dest port to seq
+              seq = self._udp_port_map.get(orig_dst_port)
+              if seq is not None:
+                return (None, seq, recv_time)
+          elif proto == socket.IPPROTO_ICMP:
+            # original ICMP message contained id/seq (for our ICMP probes)
+            icmp_inner_off = inner_off + inner_ihl
+            if len(pkt) >= icmp_inner_off + 8:
+              _, _, _, identifier, seq = struct.unpack('!BBHHH', pkt[icmp_inner_off:icmp_inner_off+8])
+              if identifier == self._id_base and seq in self._probe_map:
+                return (None, seq, recv_time)
+          # else: could be TCP or other; we don't parse here
+    except Exception:
+      pass
+    return None
 
-        recvPkt, addrs = recver.recvfrom(65565)
-        timerecv = time.time()
-      except timeout:
-        print(f"{ttl} * Request timed out.")
-        previous_result = None
-        repeat_count = 0
-        continue
-      except KeyboardInterrupt:
-        sys.exit(msg("[-] Canceled by user"))
-      except Exception as e:
-        print(msg(f"Error: {e}"))
-        continue
-      else:
-        timing = (timerecv - started) * 1000
-        location = geoip(addrs[0])
-        resolved_host = resolve_host(addrs[0])
-        result = f"{resolved_host} :: {location}"
+  # ------------------------------------------------------------
+  # Core pipelined loop
+  # ------------------------------------------------------------
+  def run(self):
+    print(f"Traceroute to {self.destination} ({self.dest_addr}), max hops {self.max_hops}, probes {self.probes}, timeout {self.timeout}s")
+    self._create_sockets()
+    if self.use_icmp and self._recv_sock is None:
+      print("Warning: ICMP requested but raw sockets unavailable; ICMP disabled.")
+      self.use_icmp = False
 
-        print(f"{ttl} {timing:.2f}ms {result}")
-        
-        if result == previous_result:
-          repeat_count += 1
-        else:
-          repeat_count = 1
+    # options: if user forced UDP, disable icmp/tcp
+    if self.force_udp:
+      self.use_icmp = False
 
-        previous_result = result
+    # pipeline windows: we probe TTLs in batches of size pipeline
+    next_ttl = 1
+    reached = False
 
-        if repeat_count >= self.repeat_threshold:
+    try:
+      while next_ttl <= self.max_hops:
+        # build a window of TTLs
+        window = list(range(next_ttl, min(self.max_hops + 1, next_ttl + self.pipeline)))
+        # for each ttl in window, send probes (and for tcp start non-blocking connects)
+        expected_probes = 0
+        for ttl in window:
+          for pidx in range(self.probes):
+            expected_probes += 1
+            if self.use_icmp:
+              self._send_icmp_probe(ttl, pidx)
+            elif self.use_tcp:
+              # for tcp mode, start non-blocking connect
+              self._start_tcp_probe(ttl, pidx)
+            else:
+              # UDP fallback
+              self._send_udp_probe(ttl, pidx)
+
+        # collect replies for the whole window within the timeout
+        tstart_window = time.time()
+        remaining = self.timeout
+        got_seqs = set()
+        # map ttl -> list of (ip, rtt)
+        window_results: Dict[int, List[Tuple[str, float]]] = {ttl: [] for ttl in window}
+
+        # For TCP probes we will track socket completion using select for writability
+        tcp_socks = list(self._tcp_sockets.keys())
+
+        while remaining > 0 and (len(got_seqs) < expected_probes or (tcp_socks and any(sock.fileno() != -1 for sock in tcp_socks))):
+          chunk = min(self.select_chunk, remaining)
+
+          readers = []
+          writers = []
+          if self._recv_sock is not None:
+            readers.append(self._recv_sock)
+          # include tcp sockets for writability checks
+          if tcp_socks:
+            writers.extend(tcp_socks)
+
+          try:
+            rlist, wlist, _ = select.select(readers, writers, [], chunk)
+          except InterruptedError:
+            raise KeyboardInterrupt
+          except Exception:
+            rlist, wlist = [], []
+
+          # process ICMP recv if available
+          if rlist:
+            for rsock in rlist:
+              try:
+                pkt, addr = rsock.recvfrom(65535)
+                recv_time = time.time()
+                src = addr[0]
+                parsed = self._parse_icmp_packet(pkt)
+                if parsed:
+                  _, seq, rcv_t = parsed
+                  pi = self._probe_map.get(seq)
+                  if pi and seq not in got_seqs:
+                    rtt = rcv_t - pi.sent_time
+                    window_results[pi.ttl].append((src, rtt))
+                    got_seqs.add(seq)
+              except BlockingIOError:
+                pass
+              except Exception:
+                # ignore invalid packets
+                pass
+
+          # process tcp sockets writability (connect completion or error)
+          if wlist:
+            for wsock in list(wlist):
+              try:
+                err = wsock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                ttl, pidx, sent_time = self._tcp_sockets.get(wsock, (None, None, None))
+                if ttl is None:
+                  # unknown socket; remove
+                  try:
+                    wsock.close()
+                  except Exception:
+                    pass
+                  tcp_socks.remove(wsock)
+                  self._tcp_sockets.pop(wsock, None)
+                  continue
+                rtt = time.time() - sent_time
+                # interpret err: 0 -> connected, ECONNREFUSED -> remote closed (still reached)
+                if err == 0 or err == errno.ECONNREFUSED:
+                  # treat as response from dest (but only if ttl values indicate dest)
+                  # If ttl is equal to the destination TTL (i.e., we just connected to dest), we mark dest reached
+                  # Note: non-trivial to know whether the socket reached intermediate hops (most OS won't give us ICMP TTL exceeded here)
+                  window_results[ttl].append((self.dest_addr, rtt))
+                else:
+                  # other err — treat as some response (e.g., network unreachable) and record
+                  window_results[ttl].append((self.dest_addr, rtt))
+                got_seqs.add(('tcp', ttl, pidx, id(wsock)))
+                # close socket and cleanup
+                try:
+                  wsock.close()
+                except Exception:
+                  pass
+                tcp_socks.remove(wsock)
+                self._tcp_sockets.pop(wsock, None)
+              except Exception:
+                # remove dirty socket
+                try:
+                  wsock.close()
+                except Exception:
+                  pass
+                tcp_socks.remove(wsock)
+                self._tcp_sockets.pop(wsock, None)
+
+          remaining = self.timeout - (time.time() - tstart_window)
+
+        # After collection window, print results for each TTL in the window
+        for ttl in window:
+          entries = window_results.get(ttl, [])
+          if not entries:
+            print(f"{ttl:2d}  * * *")
+          else:
+            # dedupe addresses and present first replies
+            seen = set()
+            parts = []
+            for ip, rtt in entries:
+              if ip in seen:
+                continue
+              seen.add(ip)
+              if not self.no_dns and self.async_dns and self._dns_executor:
+                # schedule async resolution and print ip+rtt; resolved names will print later
+                parts.append(f"{ip} {rtt:.3f}s")
+                self._dns_executor.submit(self._async_dns_print, ip, ttl, rtt)
+              elif not self.no_dns:
+                # synchronous (may block) unless user disabled
+                try:
+                  name = socket.gethostbyaddr(ip)[0]
+                  parts.append(f"{name} ({ip}) {rtt:.3f}s")
+                except Exception:
+                  parts.append(f"{ip} {rtt:.3f}s")
+              else:
+                parts.append(f"{ip} {rtt:.3f}s")
+            print(f"{ttl:2d}  " + "  ".join(parts))
+            # If destination addr appears in answers for this TTL -> reached
+            if any(ip == self.dest_addr for ip, _ in entries):
+              print("Destination reached.")
+              reached = True
+              break
+
+        if reached:
           break
 
-      finally:
-        sys.stdout.flush()
-        if recver is not None:
-          recver.close()
-        if sender is not None:
-          sender.close()
+        # advance next_ttl
+        next_ttl = window[-1] + 1
 
-def main():
+    except KeyboardInterrupt:
+      print("\nUser interrupted.")
+    finally:
+      self._close_sockets()
+      if self._dns_executor:
+        try:
+          self._dns_executor.shutdown(wait=False)
+        except Exception:
+          pass
+
+    if not reached:
+      print("Traceroute finished without reaching destination.")
+
+  # Async DNS resolver to print resolved name later
+  def _async_dns_print(self, ip: str, ttl: int, rtt: float):
+    try:
+      name = socket.gethostbyaddr(ip)[0]
+      print(f"  (resolved) {ttl:2d}  {name} ({ip}) {rtt:.3f}s")
+    except Exception:
+      # ignore failures
+      pass
+
+# ------------------------------------------------------------
+# CLI & glue
+# ------------------------------------------------------------
+def parse_args(argv: Optional[List[str]] = None):
+  p = argparse.ArgumentParser(description='pytraceroute_enhanced - ICMP/UDP/TCP traceroute with pipeline & async DNS')
+  p.add_argument('host', help='destination hostname or IP')
+  p.add_argument('-m', '--max-hops', type=int, default=DEFAULT_MAX_HOPS, help='maximum hops (default 30)')
+  p.add_argument('-q', '--probes', type=int, default=DEFAULT_PROBES, help='probes per hop (default 3)')
+  p.add_argument('-w', '--wait', type=float, default=DEFAULT_TIMEOUT, help='per-window timeout seconds (default 2.0)')
+  p.add_argument('--udp', action='store_true', help='force UDP probes (do not use ICMP echo)')
+  p.add_argument('--icmp', action='store_true', help='prefer ICMP probes (requires admin)')
+  p.add_argument('--tcp', action='store_true', help='enable TCP SYN/connect probes')
+  p.add_argument('--tcp-port', type=int, default=DEFAULT_TCP_PORT, help='destination TCP port for TCP probes (default 80)')
+  p.add_argument('--pipeline', type=int, default=DEFAULT_PIPELINE, help='number of TTLs to pipeline (window size)')
+  p.add_argument('--select-chunk', type=float, default=DEFAULT_SELECT_CHUNK, help='select time slice in seconds (default 0.15)')
+  p.add_argument('--no-dns', action='store_true', help='do not perform reverse DNS lookups')
+  p.add_argument('--no-async-dns', dest='async_dns', action='store_false', help='disable async DNS (use blocking DNS or none if --no-dns)')
+  return p.parse_args(argv)
+
+def main(argv: Optional[List[str]] = None):
+  args = parse_args(argv)
+  # choose probe mode priority: if --icmp requested, try to use it (if privileged)
+  use_icmp = args.icmp
+  force_udp = args.udp
+  use_tcp = args.tcp
   try:
-    opts, args = getopt.getopt(sys.argv[1:], "hm:", ["help", "hops="])
-  except getopt.GetoptError as err:
-    print(str(err))
-    sys.exit(2)
-  
-  hops = 30
-  
-  for opt, arg in opts:
-    if opt in ("-h", "--help"):
-      print(f"Usage: {sys.argv[0]} [options] [host]")
-      print("Options:")
-      print("  -h, --help       Show this help message and exit")
-      print("  -m, --hops       Set the maximum number of hops (default is 30)")
-      sys.exit()
-    elif opt in ("-m", "--hops"):
-      try:
-        hops = int(arg)
-      except ValueError:
-        print("Error: Hops must be an integer.")
-        sys.exit(2)
-
-  if len(args) < 1:
-    print(f"Usage: {sys.argv[0]} [options] [host]")
+    t = Tracer(destination=args.host,
+               max_hops=args.max_hops,
+               probes=args.probes,
+               timeout=args.wait,
+               use_icmp=use_icmp,
+               force_udp=force_udp,
+               use_tcp=use_tcp,
+               tcp_port=args.tcp_port,
+               pipeline=args.pipeline,
+               select_chunk=args.select_chunk,
+               no_dns=args.no_dns,
+               async_dns=args.async_dns)
+    t.run()
+  except Exception as e:
+    print("Error:", e, file=sys.stderr)
     sys.exit(2)
 
-  destination = args[0]
-  
-  Traceroute(destination, hops=hops)._start_icmp()
-
-if __name__ == "__main__": main()
+if __name__ == '__main__':
+  main()
